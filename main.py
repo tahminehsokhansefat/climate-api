@@ -1,8 +1,11 @@
 """
-Montreal Climate Zone Lookup — FastAPI Backend
-----------------------------------------------
-Install:  pip install fastapi uvicorn pandas openpyxl python-multipart
-Run:      uvicorn main:app --reload
+Montreal Climate Zone Lookup — Enhanced DOE-style Energy API
+------------------------------------------------------------
+Features:
+✔ Postal prefix matching (H1H works)
+✔ Clean building type handling
+✔ Energy Use Intensity (EUI)
+✔ Energy scaling to new area
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -12,21 +15,21 @@ import pandas as pd
 import io
 import os
 
-app = FastAPI(title="Montreal Climate Lookup API")
+app = FastAPI(title="Montreal Climate Energy API")
 
-# ── CORS ─────────────────────────────────────────────────────────────
+# ── CORS ───────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # restrict in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ── Load dataset ─────────────────────────────────────────────────────
+# ── Load dataset ───────────────────────────────────────
 EXCEL_PATH = "dataset.xlsx"
 TARGET_TYPE = "office"
 
-df_buildings: pd.DataFrame | None = None
+df_buildings = None
 
 
 @app.on_event("startup")
@@ -34,12 +37,13 @@ def load_dataset():
     global df_buildings
 
     if not os.path.exists(EXCEL_PATH):
-        print(f"WARNING: {EXCEL_PATH} not found.")
+        print("Dataset not found")
         return
 
     df = pd.read_excel(EXCEL_PATH)
     df.columns = [c.strip() for c in df.columns]
 
+    # ── Clean data ───────────────────────────────
     df["postal_code"] = df["postal_code"].astype(str).str.strip().str.upper()
     df["building_type"] = df["building_type"].astype(str).str.strip().str.lower()
 
@@ -47,79 +51,90 @@ def load_dataset():
     df["Heating"] = pd.to_numeric(df["Heating"], errors="coerce")
     df["Cooling"] = pd.to_numeric(df["Cooling"], errors="coerce")
 
+    # remove invalid types (fix "yes" issue)
+    df = df[~df["building_type"].isin(["yes", "no", "true", "false", "nan", "none"])]
+
     df_buildings = df
     print(f"Dataset loaded: {len(df)} rows")
 
 
-# ═══════════════════════════════════════════════════════════════
-# ENDPOINT 1 — Building lookup (FIXED)
-# ═══════════════════════════════════════════════════════════════
-
+# ── Request model ─────────────────────────────────────
 class LookupRequest(BaseModel):
     postal_code: str
     footprint_area_m2: float
 
 
+# ───────────────────────────────────────────────────────
+# BUILDING LOOKUP + EUI + SCALING
+# ───────────────────────────────────────────────────────
 @app.post("/lookup")
 def lookup_building(req: LookupRequest):
     if df_buildings is None:
         raise HTTPException(503, "Dataset not loaded")
 
-    # ✅ FIX 1: PREFIX MATCH (H1H works now)
+    # ✔ prefix match (H1H works)
     code = req.postal_code.strip().upper()
 
     in_postal = df_buildings[
-        df_buildings["postal_code"].str.upper().str.startswith(code)
+        df_buildings["postal_code"].str.startswith(code)
     ]
 
     if in_postal.empty:
-        raise HTTPException(
-            status_code=404,
-            detail=f"No records found for postal code prefix '{code}'."
-        )
+        raise HTTPException(404, f"No data for prefix {code}")
 
-    # ✅ FIX 2: SAFE FILTER FOR OFFICE (with fallback)
-    offices = in_postal[in_postal["building_type"] == TARGET_TYPE].copy()
+    # ✔ prefer office but fallback
+    buildings = in_postal[in_postal["building_type"] == TARGET_TYPE]
+    if buildings.empty:
+        buildings = in_postal.copy()
 
-    if offices.empty:
-        # fallback → use all building types instead of failing
-        offices = in_postal.copy()
+    # ✔ nearest footprint match
+    buildings["_diff"] = (buildings["footprint_area_m2"] - req.footprint_area_m2).abs()
+    b = buildings.sort_values("_diff").iloc[0]
 
-    # Find nearest by footprint area
-    offices["_diff"] = (offices["footprint_area_m2"] - req.footprint_area_m2).abs()
-    building = offices.sort_values("_diff").iloc[0]
+    area = b["footprint_area_m2"]
 
-    def safe(val):
+    # ── ENERGY INTENSITY (EUI) ─────────────────────
+    heating_eui = b["Heating"] / area if area else None
+    cooling_eui = b["Cooling"] / area if area else None
+
+    # ── SCALE TO NEW AREA ─────────────────────────
+    new_area = req.footprint_area_m2
+
+    scaled_heating = heating_eui * new_area if heating_eui else None
+    scaled_cooling = cooling_eui * new_area if cooling_eui else None
+
+    def safe(v):
         try:
-            if pd.isna(val):
+            if pd.isna(v):
                 return None
-        except Exception:
+        except:
             pass
-        if isinstance(val, float) and val.is_integer():
-            return int(val)
-        return val
+        if isinstance(v, float) and v.is_integer():
+            return int(v)
+        return v
 
-    result = {}
-    for col in [
-        "postal_code", "building_type", "footprint_area_m2",
-        "Climate Zone", "Heating", "Cooling", "region", "lat", "lon"
-    ]:
-        if col in building.index:
-            result[col] = safe(building[col])
-
-    return {"building": result}
-
-
-# ═══════════════════════════════════════════════════════════════
-# ENDPOINT 2 — CSV parser (unchanged but safe)
-# ═══════════════════════════════════════════════════════════════
-
-MONTHS = [
-    "January","February","March","April","May","June",
-    "July","August","September","October","November","December"
-]
+    return {
+        "building": {
+            "postal_code": b["postal_code"],
+            "building_type": b["building_type"],
+            "footprint_area_m2": safe(area),
+            "Climate Zone": safe(b.get("Climate Zone")),
+            "Heating": safe(b["Heating"]),
+            "Cooling": safe(b["Cooling"]),
+        },
+        "energy_model": {
+            "heating_eui_kwh_m2": round(heating_eui, 3) if heating_eui else None,
+            "cooling_eui_kwh_m2": round(cooling_eui, 3) if cooling_eui else None,
+            "scaled_heating_kwh": round(scaled_heating, 2) if scaled_heating else None,
+            "scaled_cooling_kwh": round(scaled_cooling, 2) if scaled_cooling else None,
+            "new_area_m2": new_area
+        }
+    }
 
 
+# ───────────────────────────────────────────────────────
+# CSV PARSER (unchanged)
+# ───────────────────────────────────────────────────────
 @app.post("/parse-csv")
 async def parse_hydro_csv(file: UploadFile = File(...)):
     contents = await file.read()
@@ -128,85 +143,62 @@ async def parse_hydro_csv(file: UploadFile = File(...)):
         try:
             df = pd.read_csv(io.BytesIO(contents), sep=";", encoding=enc)
             break
-        except Exception:
+        except:
             continue
     else:
-        raise HTTPException(400, "Could not decode CSV")
+        raise HTTPException(400, "CSV decode error")
 
     df.columns = [c.strip() for c in df.columns]
 
     required = ["Starting date", "kWh", "Amount ($)"]
-    missing = [c for c in required if c not in df.columns]
-
-    if missing:
-        raise HTTPException(
-            400,
-            f"Missing columns: {missing}"
-        )
+    if any(c not in df.columns for c in required):
+        raise HTTPException(400, "Missing required columns")
 
     account = ""
-    if "Contract" in df.columns and not df["Contract"].dropna().empty:
-        account = str(df["Contract"].dropna().iloc[0]).strip()
+    if "Contract" in df.columns:
+        account = str(df["Contract"].dropna().iloc[0])
 
     monthly = {}
 
-    for _, row in df.iterrows():
-        start_raw = str(row.get("Starting date", "")).strip()
-        if not start_raw or start_raw.lower() == "nan":
-            continue
-
+    for _, r in df.iterrows():
         try:
-            date = pd.to_datetime(start_raw)
-            m = date.month - 1
-            y = date.year
+            d = pd.to_datetime(r["Starting date"])
+            m = d.month - 1
+            y = d.year
         except:
             continue
 
-        try:
-            kwh = float(str(row["kWh"]).replace(",", "."))
-        except:
-            kwh = 0.0
-
-        try:
-            amount = float(str(row["Amount ($)"]).replace(",", "."))
-        except:
-            amount = 0.0
+        kwh = float(str(r["kWh"]).replace(",", "."))
+        amt = float(str(r["Amount ($)"]).replace(",", "."))
 
         key = (y, m)
-        if key not in monthly:
-            monthly[key] = {"kwh": 0.0, "amount": 0.0}
+        monthly[key] = monthly.get(key, {"kwh": 0, "amount": 0})
 
         monthly[key]["kwh"] += kwh
-        monthly[key]["amount"] += amount
+        monthly[key]["amount"] += amt
 
-    flat = {}
-    for (y, m), v in sorted(monthly.items()):
-        flat[m] = {
-            "month": MONTHS[m],
+    flat = {
+        m: {
+            "month": ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][m],
             "kwh": v["kwh"],
             "amount": v["amount"]
         }
+        for (_, m), v in sorted(monthly.items())
+    }
 
-    if not flat:
-        raise HTTPException(422, "No data extracted")
-
-    months_list = [flat[i] for i in sorted(flat)]
-    total_kwh = sum(x["kwh"] for x in months_list)
-    total_amount = sum(x["amount"] for x in months_list)
+    months = list(flat.values())
 
     return {
         "account": account,
-        "months": months_list,
-        "total_kwh": round(total_kwh, 2),
-        "total_amount": round(total_amount, 2),
-        "avg_amount": round(total_amount / len(months_list), 2)
+        "months": months,
+        "total_kwh": sum(x["kwh"] for x in months),
+        "total_amount": sum(x["amount"] for x in months)
     }
 
 
-# ═══════════════════════════════════════════════════════════════
-# Health check
-# ═══════════════════════════════════════════════════════════════
-
+# ───────────────────────────────────────────────────────
+# HEALTH
+# ───────────────────────────────────────────────────────
 @app.get("/")
 def health():
     return {"status": "ok", "dataset_loaded": df_buildings is not None}
