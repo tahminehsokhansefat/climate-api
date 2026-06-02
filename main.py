@@ -4,6 +4,8 @@ Montreal Climate Zone Lookup — DOE Reference Area Scaling Model
 ✔ Uses fixed DOE medium office baseline = 5000 m²
 ✔ Normalizes Heating/Cooling by reference area
 ✔ Scales to user input area
+✔ Filters for office buildings (building_type == "yes")
+✔ Parses Hydro-Québec CSV bills
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -23,9 +25,9 @@ app.add_middleware(
 )
 
 EXCEL_PATH = "dataset.xlsx"
-TARGET_TYPE = "office"
+TARGET_TYPE = "yes"          # ✅ office buildings flagged as "yes" in dataset
 
-REFERENCE_AREA = 5000  # ✅ YOUR DOE BASELINE
+REFERENCE_AREA = 5000        # ✅ DOE medium office baseline
 
 df_buildings = None
 
@@ -41,14 +43,15 @@ def load_dataset():
     df = pd.read_excel(EXCEL_PATH)
     df.columns = [c.strip() for c in df.columns]
 
-    df["postal_code"] = df["postal_code"].astype(str).str.strip().str.upper()
+    df["postal_code"]   = df["postal_code"].astype(str).str.strip().str.upper()
     df["building_type"] = df["building_type"].astype(str).str.strip().str.lower()
 
     df["footprint_area_m2"] = pd.to_numeric(df["footprint_area_m2"], errors="coerce")
-    df["Heating"] = pd.to_numeric(df["Heating"], errors="coerce")
-    df["Cooling"] = pd.to_numeric(df["Cooling"], errors="coerce")
+    df["Heating"]           = pd.to_numeric(df["Heating"],           errors="coerce")
+    df["Cooling"]           = pd.to_numeric(df["Cooling"],           errors="coerce")
 
-    df = df[~df["building_type"].isin(["yes", "no", "true", "false", "nan", "none"])]
+    # ✅ keep "yes" rows — do NOT strip them out
+    df = df[~df["building_type"].isin(["no", "true", "false", "nan", "none"])]
 
     df_buildings = df
     print(f"Dataset loaded: {len(df)} rows")
@@ -69,7 +72,7 @@ def lookup_building(req: LookupRequest):
 
     code = req.postal_code.strip().upper()
 
-    # prefix match
+    # prefix match on postal code
     in_postal = df_buildings[
         df_buildings["postal_code"].str.startswith(code)
     ]
@@ -77,29 +80,25 @@ def lookup_building(req: LookupRequest):
     if in_postal.empty:
         raise HTTPException(404, f"No data for prefix {code}")
 
+    # filter for office buildings (yes), fallback to all if none found
     buildings = in_postal[in_postal["building_type"] == TARGET_TYPE]
     if buildings.empty:
         buildings = in_postal.copy()
 
+    # find closest area match
+    buildings = buildings.copy()
     buildings["_diff"] = (
         buildings["footprint_area_m2"] - req.footprint_area_m2
     ).abs()
 
     b = buildings.sort_values("_diff").iloc[0]
 
-    # ─────────────────────────────────────────────
-    # STEP 1: normalize using REFERENCE AREA (5000 m²)
-    # ─────────────────────────────────────────────
-
+    # ── STEP 1: normalize by reference area (5000 m²) ──
     heating_ref = b["Heating"] / REFERENCE_AREA
     cooling_ref = b["Cooling"] / REFERENCE_AREA
 
-    # ─────────────────────────────────────────────
-    # STEP 2: scale to user input area
-    # ─────────────────────────────────────────────
-
-    user_area = req.footprint_area_m2
-
+    # ── STEP 2: scale to user input area ──
+    user_area      = req.footprint_area_m2
     scaled_heating = heating_ref * user_area
     scaled_cooling = cooling_ref * user_area
 
@@ -114,24 +113,63 @@ def lookup_building(req: LookupRequest):
         return v
 
     return {
-      "building": {
-    "postal_code": b["postal_code"],
-    "building_type": b["building_type"],
-    "footprint_area_m2": safe(b["footprint_area_m2"]),
-    "climate_zone": safe(b["Climate Zone"]),
-},
+        "building": {
+            "postal_code":    b["postal_code"],
+            "building_type":  b["building_type"],
+            "footprint_area_m2": safe(b["footprint_area_m2"]),
+            "climate_zone":   safe(b["Climate Zone"]),
+        },
         "energy_model": {
-            "reference_area_m2": REFERENCE_AREA,
-
+            "reference_area_m2":  REFERENCE_AREA,
             "heating_kwh_m2_ref": round(heating_ref, 4),
             "cooling_kwh_m2_ref": round(cooling_ref, 4),
-
             "scaled_heating_kwh": round(scaled_heating, 2),
             "scaled_cooling_kwh": round(scaled_cooling, 2),
-
-            "user_area_m2": user_area
+            "user_area_m2":       user_area,
         }
     }
+
+
+# ─────────────────────────────────────────────
+@app.post("/parse-csv")
+async def parse_csv(file: UploadFile = File(...)):
+    try:
+        contents = await file.read()
+        df = pd.read_csv(io.BytesIO(contents), encoding="latin1", sep=";")
+        df.columns = [c.strip() for c in df.columns]
+
+        months = []
+        for _, row in df.iterrows():
+            try:
+                kwh    = float(row["kWh"])        if pd.notna(row["kWh"])        else 0
+                amount = float(row["Amount ($)"])  if pd.notna(row["Amount ($)"]) else 0
+                start  = str(row["Starting date"])[:7]   # e.g. "2026-02"
+                months.append({
+                    "month":  start,
+                    "kwh":    round(kwh, 2),
+                    "amount": round(amount, 2),
+                })
+            except:
+                continue
+
+        if not months:
+            raise HTTPException(400, "No valid billing data found in CSV")
+
+        total_kwh    = sum(m["kwh"]    for m in months)
+        total_amount = sum(m["amount"] for m in months)
+        avg_amount   = total_amount / len(months) if months else 0
+
+        return {
+            "months":       months,
+            "total_kwh":    round(total_kwh, 2),
+            "total_amount": round(total_amount, 2),
+            "avg_amount":   round(avg_amount, 2),
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, f"Could not parse CSV: {str(e)}")
 
 
 # ─────────────────────────────────────────────
