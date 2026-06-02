@@ -114,11 +114,12 @@ def lookup_building(req: LookupRequest):
         return v
 
     return {
-        "building": {
-            "postal_code": b["postal_code"],
-            "building_type": b["building_type"],
-            "footprint_area_m2": safe(b["footprint_area_m2"]),
-        },
+      "building": {
+    "postal_code": b["postal_code"],
+    "building_type": b["building_type"],
+    "footprint_area_m2": safe(b["footprint_area_m2"]),
+    "climate_zone": safe(b["Climate Zone"]),
+},
         "energy_model": {
             "reference_area_m2": REFERENCE_AREA,
 
