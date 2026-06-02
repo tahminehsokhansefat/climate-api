@@ -5,6 +5,7 @@ Montreal Climate Zone Lookup — DOE Reference Area Scaling Model
 ✔ Normalizes Heating/Cooling by reference area
 ✔ Scales to user input area
 ✔ Filters for office buildings (building_type == "yes")
+✔ Falls back to nearby postal codes if no match
 ✔ Parses Hydro-Québec CSV bills
 """
 
@@ -24,10 +25,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-EXCEL_PATH = "dataset.xlsx"
-TARGET_TYPE = "yes"          # ✅ office buildings flagged as "yes" in dataset
-
-REFERENCE_AREA = 5000        # ✅ DOE medium office baseline
+EXCEL_PATH    = "dataset.xlsx"
+TARGET_TYPE   = "yes"       # office buildings flagged as "yes"
+REFERENCE_AREA = 5000       # DOE medium office baseline
 
 df_buildings = None
 
@@ -50,8 +50,8 @@ def load_dataset():
     df["Heating"]           = pd.to_numeric(df["Heating"],           errors="coerce")
     df["Cooling"]           = pd.to_numeric(df["Cooling"],           errors="coerce")
 
-    # ✅ keep "yes" rows — do NOT strip them out
-    df = df[~df["building_type"].isin(["no", "true", "false", "nan", "none"])]
+    # Keep "yes" rows — do NOT strip them out
+    df = df[~df["building_type"].isin(["no", "true", "false", "nan", "none", ""])]
 
     df_buildings = df
     print(f"Dataset loaded: {len(df)} rows")
@@ -70,27 +70,29 @@ def lookup_building(req: LookupRequest):
     if df_buildings is None:
         raise HTTPException(503, "Dataset not loaded")
 
-    code = req.postal_code.strip().upper()
+    code = req.postal_code.strip().upper()[:3]
 
-    # prefix match on postal code
-    in_postal = df_buildings[
-        df_buildings["postal_code"].str.startswith(code)
-    ]
+    # ── Try exact 3-char prefix match ──
+    in_postal = df_buildings[df_buildings["postal_code"].str.startswith(code)]
+
+    # ── Fallback 1: try 2-char prefix ──
+    if in_postal.empty:
+        in_postal = df_buildings[df_buildings["postal_code"].str.startswith(code[:2])]
+
+    # ── Fallback 2: try 1-char prefix ──
+    if in_postal.empty:
+        in_postal = df_buildings[df_buildings["postal_code"].str.startswith(code[:1])]
 
     if in_postal.empty:
-        raise HTTPException(404, f"No data for prefix {code}")
+        raise HTTPException(404, f"No data found for postal code {code}")
 
-    # filter for office buildings (yes), fallback to all if none found
-    buildings = in_postal[in_postal["building_type"] == TARGET_TYPE]
+    # ── Filter for office buildings, fallback to all ──
+    buildings = in_postal[in_postal["building_type"] == TARGET_TYPE].copy()
     if buildings.empty:
         buildings = in_postal.copy()
 
-    # find closest area match
-    buildings = buildings.copy()
-    buildings["_diff"] = (
-        buildings["footprint_area_m2"] - req.footprint_area_m2
-    ).abs()
-
+    # ── Find closest area match ──
+    buildings["_diff"] = (buildings["footprint_area_m2"] - req.footprint_area_m2).abs()
     b = buildings.sort_values("_diff").iloc[0]
 
     # ── STEP 1: normalize by reference area (5000 m²) ──
@@ -114,10 +116,10 @@ def lookup_building(req: LookupRequest):
 
     return {
         "building": {
-            "postal_code":    b["postal_code"],
-            "building_type":  b["building_type"],
+            "postal_code":       b["postal_code"],
+            "building_type":     b["building_type"],
             "footprint_area_m2": safe(b["footprint_area_m2"]),
-            "climate_zone":   safe(b["Climate Zone"]),
+            "climate_zone":      safe(b["Climate Zone"]),
         },
         "energy_model": {
             "reference_area_m2":  REFERENCE_AREA,
@@ -143,7 +145,7 @@ async def parse_csv(file: UploadFile = File(...)):
             try:
                 kwh    = float(row["kWh"])        if pd.notna(row["kWh"])        else 0
                 amount = float(row["Amount ($)"])  if pd.notna(row["Amount ($)"]) else 0
-                start  = str(row["Starting date"])[:7]   # e.g. "2026-02"
+                start  = str(row["Starting date"])[:7]
                 months.append({
                     "month":  start,
                     "kwh":    round(kwh, 2),
