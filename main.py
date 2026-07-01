@@ -1,11 +1,10 @@
 """
 Montreal Climate Zone Lookup — DOE Reference Area Scaling Model
 --------------------------------------------------------------
-✔ Uses fixed DOE medium office baseline = 5000 m²
-✔ Normalizes Heating/Cooling by reference area
+✔ Uses fixed DOE medium office baseline = 4982 m²
+✔ Three building vintages: New (<22yr), Medium (22-45yr), Old (>45yr)
+✔ Normalizes Heating/Cooling/CO2 by reference area
 ✔ Scales to user input area
-✔ Filters for office buildings (building_type == "yes")
-✔ Falls back to nearby postal codes if no match
 ✔ Parses Hydro-Québec CSV bills
 """
 
@@ -25,9 +24,34 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-EXCEL_PATH    = "dataset.xlsx"
-TARGET_TYPE   = "yes"       # office buildings flagged as "yes"
-REFERENCE_AREA = 5000       # DOE medium office baseline
+EXCEL_PATH     = "dataset.xlsx"
+TARGET_TYPE    = "yes"
+REFERENCE_AREA = 4982   # DOE medium office baseline (m²)
+
+# ── Building vintage energy data (per m² of reference building) ──────────────
+# Source: DOE EnergyPlus Medium Office Reference Building, Climate Zone 6A
+# MJ converted to kWh (÷3.6), values ÷ 4982 m²
+
+VINTAGES = {
+    "new": {                        # < 22 years old
+        "label": "New construction (<22 years)",
+        "heating_kwh_m2": 37.8248,  # from New.xlsx rows 130+146 → kWh/m²
+        "cooling_kwh_m2": 13.9703,  # from New.xlsx row 131 → kWh/m²
+        "co2_kg_m2":      187.4941, # from New.xlsx row 231 ÷ 4982
+    },
+    "medium": {                     # 22–45 years old
+        "label": "Existing post-1980 (22–45 years)",
+        "heating_kwh_m2": 55.9995,  # from Medium.xlsx rows 130+146 → kWh/m²
+        "cooling_kwh_m2": 17.4120,  # from Medium.xlsx row 131 → kWh/m²
+        "co2_kg_m2":      240.3794, # from Medium.xlsx row 231 ÷ 4982
+    },
+    "old": {                        # > 45 years old
+        "label": "Existing pre-1980 (>45 years)",
+        "heating_kwh_m2": 44.6837,  # from Old.xlsx row 152 (MJ→kWh) ÷ 4982
+        "cooling_kwh_m2": 14.0768,  # from Old.xlsx row 137 (kWh) ÷ 4982
+        "co2_kg_m2":      227.8603, # from Old.xlsx row 303 ÷ 4982
+    },
+}
 
 df_buildings = None
 
@@ -50,7 +74,6 @@ def load_dataset():
     df["Heating"]           = pd.to_numeric(df["Heating"],           errors="coerce")
     df["Cooling"]           = pd.to_numeric(df["Cooling"],           errors="coerce")
 
-    # Keep "yes" rows — do NOT strip them out
     df = df[~df["building_type"].isin(["no", "true", "false", "nan", "none", ""])]
 
     df_buildings = df
@@ -59,8 +82,9 @@ def load_dataset():
 
 # ─────────────────────────────────────────────
 class LookupRequest(BaseModel):
-    postal_code: str
+    postal_code:      str
     footprint_area_m2: float
+    building_age:     float = 0   # years — used to select vintage
 
 
 # ─────────────────────────────────────────────
@@ -72,47 +96,45 @@ def lookup_building(req: LookupRequest):
 
     code = req.postal_code.strip().upper()[:3]
 
-    # ── Try exact 3-char prefix match ──
+    # ── Postal prefix match with fallback ──
     in_postal = df_buildings[df_buildings["postal_code"].str.startswith(code)]
-
-    # ── Fallback 1: try 2-char prefix ──
     if in_postal.empty:
         in_postal = df_buildings[df_buildings["postal_code"].str.startswith(code[:2])]
-
-    # ── Fallback 2: try 1-char prefix ──
     if in_postal.empty:
         in_postal = df_buildings[df_buildings["postal_code"].str.startswith(code[:1])]
-
     if in_postal.empty:
         raise HTTPException(404, f"No data found for postal code {code}")
 
-    # ── Filter for office buildings, fallback to all ──
+    # ── Filter for office buildings ──
     buildings = in_postal[in_postal["building_type"] == TARGET_TYPE].copy()
     if buildings.empty:
         buildings = in_postal.copy()
 
-    # ── Find closest area match ──
     buildings["_diff"] = (buildings["footprint_area_m2"] - req.footprint_area_m2).abs()
     b = buildings.sort_values("_diff").iloc[0]
 
-    # ── STEP 1: normalize by reference area (5000 m²) ──
-    heating_ref = b["Heating"] / REFERENCE_AREA
-    cooling_ref = b["Cooling"] / REFERENCE_AREA
+    # ── Select vintage based on building age ──
+    age = req.building_age
+    if age > 45:
+        vintage_key = "old"
+    elif age >= 22:
+        vintage_key = "medium"
+    else:
+        vintage_key = "new"
 
-    # ── STEP 2: scale to user input area ──
-    user_area      = req.footprint_area_m2
-    scaled_heating = heating_ref * user_area
-    scaled_cooling = cooling_ref * user_area
+    v = VINTAGES[vintage_key]
+    user_area = req.footprint_area_m2
 
-    def safe(v):
+    scaled_heating = v["heating_kwh_m2"] * user_area
+    scaled_cooling = v["cooling_kwh_m2"] * user_area
+    scaled_co2     = v["co2_kg_m2"]     * user_area
+
+    def safe(val):
         try:
-            if pd.isna(v):
-                return None
-        except:
-            pass
-        if isinstance(v, float) and v.is_integer():
-            return int(v)
-        return v
+            if pd.isna(val): return None
+        except: pass
+        if isinstance(val, float) and val.is_integer(): return int(val)
+        return val
 
     return {
         "building": {
@@ -122,11 +144,16 @@ def lookup_building(req: LookupRequest):
             "climate_zone":      safe(b["Climate Zone"]),
         },
         "energy_model": {
+            "vintage":            vintage_key,
+            "vintage_label":      v["label"],
+            "building_age":       age,
             "reference_area_m2":  REFERENCE_AREA,
-            "heating_kwh_m2_ref": round(heating_ref, 4),
-            "cooling_kwh_m2_ref": round(cooling_ref, 4),
+            "heating_kwh_m2":     round(v["heating_kwh_m2"], 4),
+            "cooling_kwh_m2":     round(v["cooling_kwh_m2"], 4),
+            "co2_kg_m2":          round(v["co2_kg_m2"], 4),
             "scaled_heating_kwh": round(scaled_heating, 2),
             "scaled_cooling_kwh": round(scaled_cooling, 2),
+            "scaled_co2_kg":      round(scaled_co2, 2),
             "user_area_m2":       user_area,
         }
     }
@@ -146,11 +173,7 @@ async def parse_csv(file: UploadFile = File(...)):
                 kwh    = float(row["kWh"])        if pd.notna(row["kWh"])        else 0
                 amount = float(row["Amount ($)"])  if pd.notna(row["Amount ($)"]) else 0
                 start  = str(row["Starting date"])[:7]
-                months.append({
-                    "month":  start,
-                    "kwh":    round(kwh, 2),
-                    "amount": round(amount, 2),
-                })
+                months.append({ "month": start, "kwh": round(kwh, 2), "amount": round(amount, 2) })
             except:
                 continue
 
