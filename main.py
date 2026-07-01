@@ -51,12 +51,13 @@ def read_vintage(path: str, label: str, co2_row: int) -> dict:
         v = rows[r - 1][2]   # column C (0-indexed = 2)
         return float(v) if v is not None else 0.0
 
-    # Detect file type by checking row 63 header
-    row63 = str(rows[62][1] or "").strip()
+    # Detect file type: Old.xlsx has different structure
+    # Old.xlsx row 136 = Heating (=0), New/Medium row 136 = Fans (non-zero MJ/m2)
+    row136_label = str(rows[135][1] or "").strip()
 
-    if "Electricity (kWh)" in row63:
+    if row136_label == "Heating":
         # ── Old.xlsx format ──
-        # row 136 = Heating elec kWh (= 0 for old)
+        # row 136 = Heating elec kWh (= 0)
         # row 137 = Cooling elec kWh
         # row 152 = Heating gas MJ
         heat_elec = val(136)
