@@ -1,11 +1,11 @@
 """
 Montreal Climate Zone Lookup — DOE Reference Area Scaling Model
 --------------------------------------------------------------
-✔ Uses fixed DOE medium office baseline = 4982 m²
-✔ Three building vintages: New (<22yr), Medium (22-45yr), Old (>45yr)
-✔ Normalizes Heating/Cooling/CO2 by reference area
-✔ Scales to user input area
-✔ Parses Hydro-Québec CSV bills
+Source: DOE EnergyPlus Medium Office Reference Building, Climate Zone 5A
+Three vintages: New (<22yr), Medium (22-45yr), Old (>45yr)
+Heating = Electricity heating (kWh) + Gas heating (MJ ÷ 3.6)
+Cooling = Electricity cooling (kWh) only
+All values divided by 5000 m² reference area, then scaled to user area
 """
 
 from fastapi import FastAPI, UploadFile, File, HTTPException
@@ -26,30 +26,39 @@ app.add_middleware(
 
 EXCEL_PATH     = "dataset.xlsx"
 TARGET_TYPE    = "yes"
-REFERENCE_AREA = 4982   # DOE medium office baseline (m²)
+REFERENCE_AREA = 5000   # as specified
 
-# ── Building vintage energy data (per m² of reference building) ──────────────
-# Source: DOE EnergyPlus Medium Office Reference Building, Climate Zone 6A
-# MJ converted to kWh (÷3.6), values ÷ 4982 m²
+# ── Per-m² values from DOE EnergyPlus raw data ÷ 5000 ──────────────────────
+# OLD   (>45yr):  Heating = 0 + 801410 MJ÷3.6 = 222614 kWh ÷ 5000
+#                 Cooling = 70131 kWh ÷ 5000
+#                 CO2     = 1135200 kg ÷ 5000
+#
+# MEDIUM(22-45yr):Heating = 215697 + 227890 MJ÷3.6 = 279000 kWh ÷ 5000
+#                 Cooling = 86750 kWh ÷ 5000
+#                 CO2     = 1197570 kg ÷ 5000
+#
+# NEW   (<22yr):  Heating = 132114 + 202810 MJ÷3.6 = 188450 kWh ÷ 5000
+#                 Cooling = 69603 kWh ÷ 5000
+#                 CO2     = 934096 kg ÷ 5000
 
 VINTAGES = {
-    "new": {                        # < 22 years old
-        "label": "New construction (<22 years)",
-        "heating_kwh_m2": 37.8248,  # from New.xlsx rows 130+146 → kWh/m²
-        "cooling_kwh_m2": 13.9703,  # from New.xlsx row 131 → kWh/m²
-        "co2_kg_m2":      187.4941, # from New.xlsx row 231 ÷ 4982
+    "new": {
+        "label":          "New construction (<22 years)",
+        "heating_kwh_m2": 189123.61 / REFERENCE_AREA,  # (95.462+40.707) MJ/m² ÷3.6 ×5000
+        "cooling_kwh_m2":  69851.39 / REFERENCE_AREA,  # 50.293 MJ/m² ÷3.6 ×5000
+        "co2_kg_m2":      934095.65 / REFERENCE_AREA,  # row 231 New.xlsx
     },
-    "medium": {                     # 22–45 years old
-        "label": "Existing post-1980 (22–45 years)",
-        "heating_kwh_m2": 55.9995,  # from Medium.xlsx rows 130+146 → kWh/m²
-        "cooling_kwh_m2": 17.4120,  # from Medium.xlsx row 131 → kWh/m²
-        "co2_kg_m2":      240.3794, # from Medium.xlsx row 231 ÷ 4982
+    "medium": {
+        "label":          "Existing post-1980 (22–45 years)",
+        "heating_kwh_m2": 279997.22 / REFERENCE_AREA,  # (155.857+45.741) MJ/m² ÷3.6 ×5000
+        "cooling_kwh_m2":  87059.72 / REFERENCE_AREA,  # 62.683 MJ/m² ÷3.6 ×5000
+        "co2_kg_m2":     1197570.0  / REFERENCE_AREA,  # row 231 Medium.xlsx
     },
-    "old": {                        # > 45 years old
-        "label": "Existing pre-1980 (>45 years)",
-        "heating_kwh_m2": 44.6837,  # from Old.xlsx row 152 (MJ→kWh) ÷ 4982
-        "cooling_kwh_m2": 14.0768,  # from Old.xlsx row 137 (kWh) ÷ 4982
-        "co2_kg_m2":      227.8603, # from Old.xlsx row 303 ÷ 4982
+    "old": {
+        "label":          "Existing pre-1980 (>45 years)",
+        "heating_kwh_m2": 222613.89 / REFERENCE_AREA,  # 801410 MJ ÷3.6 (gas heating)
+        "cooling_kwh_m2":  70130.56 / REFERENCE_AREA,  # row 137 Old.xlsx (elec cooling kWh)
+        "co2_kg_m2":     1135200.0  / REFERENCE_AREA,  # row 303 Old.xlsx
     },
 }
 
@@ -59,44 +68,32 @@ df_buildings = None
 @app.on_event("startup")
 def load_dataset():
     global df_buildings
-
     if not os.path.exists(EXCEL_PATH):
         print("Dataset not found")
         return
-
     df = pd.read_excel(EXCEL_PATH)
     df.columns = [c.strip() for c in df.columns]
-
-    df["postal_code"]   = df["postal_code"].astype(str).str.strip().str.upper()
-    df["building_type"] = df["building_type"].astype(str).str.strip().str.lower()
-
+    df["postal_code"]       = df["postal_code"].astype(str).str.strip().str.upper()
+    df["building_type"]     = df["building_type"].astype(str).str.strip().str.lower()
     df["footprint_area_m2"] = pd.to_numeric(df["footprint_area_m2"], errors="coerce")
-    df["Heating"]           = pd.to_numeric(df["Heating"],           errors="coerce")
-    df["Cooling"]           = pd.to_numeric(df["Cooling"],           errors="coerce")
-
     df = df[~df["building_type"].isin(["no", "true", "false", "nan", "none", ""])]
-
     df_buildings = df
     print(f"Dataset loaded: {len(df)} rows")
 
 
-# ─────────────────────────────────────────────
 class LookupRequest(BaseModel):
-    postal_code:      str
+    postal_code:       str
     footprint_area_m2: float
-    building_age:     float = 0   # years — used to select vintage
+    building_age:      float = 0
 
 
-# ─────────────────────────────────────────────
 @app.post("/lookup")
 def lookup_building(req: LookupRequest):
-
     if df_buildings is None:
         raise HTTPException(503, "Dataset not loaded")
 
     code = req.postal_code.strip().upper()[:3]
 
-    # ── Postal prefix match with fallback ──
     in_postal = df_buildings[df_buildings["postal_code"].str.startswith(code)]
     if in_postal.empty:
         in_postal = df_buildings[df_buildings["postal_code"].str.startswith(code[:2])]
@@ -105,7 +102,6 @@ def lookup_building(req: LookupRequest):
     if in_postal.empty:
         raise HTTPException(404, f"No data found for postal code {code}")
 
-    # ── Filter for office buildings ──
     buildings = in_postal[in_postal["building_type"] == TARGET_TYPE].copy()
     if buildings.empty:
         buildings = in_postal.copy()
@@ -113,7 +109,7 @@ def lookup_building(req: LookupRequest):
     buildings["_diff"] = (buildings["footprint_area_m2"] - req.footprint_area_m2).abs()
     b = buildings.sort_values("_diff").iloc[0]
 
-    # ── Select vintage based on building age ──
+    # Select vintage
     age = req.building_age
     if age > 45:
         vintage_key = "old"
@@ -122,12 +118,12 @@ def lookup_building(req: LookupRequest):
     else:
         vintage_key = "new"
 
-    v = VINTAGES[vintage_key]
+    v         = VINTAGES[vintage_key]
     user_area = req.footprint_area_m2
 
     scaled_heating = v["heating_kwh_m2"] * user_area
     scaled_cooling = v["cooling_kwh_m2"] * user_area
-    scaled_co2     = v["co2_kg_m2"]     * user_area
+    scaled_co2     = v["co2_kg_m2"]      * user_area
 
     def safe(val):
         try:
@@ -150,54 +146,46 @@ def lookup_building(req: LookupRequest):
             "reference_area_m2":  REFERENCE_AREA,
             "heating_kwh_m2":     round(v["heating_kwh_m2"], 4),
             "cooling_kwh_m2":     round(v["cooling_kwh_m2"], 4),
-            "co2_kg_m2":          round(v["co2_kg_m2"], 4),
+            "co2_kg_m2":          round(v["co2_kg_m2"],      4),
             "scaled_heating_kwh": round(scaled_heating, 2),
             "scaled_cooling_kwh": round(scaled_cooling, 2),
-            "scaled_co2_kg":      round(scaled_co2, 2),
+            "scaled_co2_kg":      round(scaled_co2,     2),
             "user_area_m2":       user_area,
         }
     }
 
 
-# ─────────────────────────────────────────────
 @app.post("/parse-csv")
 async def parse_csv(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         df = pd.read_csv(io.BytesIO(contents), encoding="latin1", sep=";")
         df.columns = [c.strip() for c in df.columns]
-
         months = []
         for _, row in df.iterrows():
             try:
-                kwh    = float(row["kWh"])        if pd.notna(row["kWh"])        else 0
-                amount = float(row["Amount ($)"])  if pd.notna(row["Amount ($)"]) else 0
+                kwh    = float(row["kWh"])       if pd.notna(row["kWh"])       else 0
+                amount = float(row["Amount ($)"]) if pd.notna(row["Amount ($)"]) else 0
                 start  = str(row["Starting date"])[:7]
-                months.append({ "month": start, "kwh": round(kwh, 2), "amount": round(amount, 2) })
+                months.append({"month": start, "kwh": round(kwh, 2), "amount": round(amount, 2)})
             except:
                 continue
-
         if not months:
             raise HTTPException(400, "No valid billing data found in CSV")
-
         total_kwh    = sum(m["kwh"]    for m in months)
         total_amount = sum(m["amount"] for m in months)
-        avg_amount   = total_amount / len(months) if months else 0
-
         return {
             "months":       months,
             "total_kwh":    round(total_kwh, 2),
             "total_amount": round(total_amount, 2),
-            "avg_amount":   round(avg_amount, 2),
+            "avg_amount":   round(total_amount / len(months), 2) if months else 0,
         }
-
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(400, f"Could not parse CSV: {str(e)}")
 
 
-# ─────────────────────────────────────────────
 @app.get("/")
 def health():
     return {"status": "ok", "dataset_loaded": df_buildings is not None}
