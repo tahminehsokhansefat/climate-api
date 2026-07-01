@@ -48,8 +48,12 @@ def read_vintage(path: str, label: str, co2_row: int) -> dict:
     wb.close()
 
     def val(r):
-        v = rows[r - 1][2]   # column C (0-indexed = 2)
-        return float(v) if v is not None else 0.0
+        row = rows[r - 1]
+        # Find the first numeric value in the row (skip None and strings)
+        for cell in row:
+            if cell is not None and isinstance(cell, (int, float)) and not isinstance(cell, bool):
+                return float(cell)
+        return 0.0
 
     # Detect file type: Old.xlsx has different structure
     # Old.xlsx row 136 = Heating (=0), New/Medium row 136 = Fans (non-zero MJ/m2)
